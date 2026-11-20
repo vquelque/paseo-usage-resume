@@ -5,7 +5,7 @@ import type { StatusData } from "../shared/status";
 
 function formatWhen(epochMs: number): string {
   const when = new Date(epochMs);
-  const time = when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const time = when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
   if (when.toDateString() === new Date().toDateString()) return time;
   const day = when.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" });
   return `${day}, ${time}`;
