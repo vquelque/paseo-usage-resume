@@ -9,6 +9,7 @@ import {
   type PluginTurnOutcome,
 } from "@getpaseo/plugin/server";
 import { findDepletion, looksLikeLimit, type UsageEntry } from "./server/limit";
+import { STATUS_KIND, STATUS_VERSION, type StatusData } from "./shared/status";
 
 /** Sent to the agent once its quota is back. */
 const RESUME_PROMPT =
@@ -36,6 +37,9 @@ interface Pending {
   /** True once a depleted window was seen, so the next clear reading means "quota is back". */
   sawDepletion: boolean;
   blindRetryScheduled: boolean;
+  /** Timeline row that shows this resume in the agent's conversation. */
+  rowId?: string;
+  windows?: string[];
 }
 
 interface State {
@@ -127,6 +131,29 @@ export default function contribute(server: PluginServerContext) {
   let saving: Promise<void> = Promise.resolve();
   let stopped = false;
   const busy = new Set<string>();
+  /** Daemon session, taken from the first hook that fires; it lives as long as this process. */
+  let api: PluginHookContext["paseo"] | null = null;
+
+  function rowIdOf(pending: Pending): string {
+    return pending.rowId ?? `usage-resume-${pending.detectedAt}`;
+  }
+
+  /** Shows or updates the status row in the agent's conversation. Never blocks the resume. */
+  function show(agentId: string, rowId: string, status: Partial<StatusData> & Pick<StatusData, "state">): void {
+    if (!api) return;
+    const data: StatusData = {
+      resumeAt: null,
+      windows: [],
+      attempt: null,
+      maxAttempts: MAX_ATTEMPTS,
+      reason: null,
+      ...status,
+    };
+    api.agents
+      .ref(agentId)
+      .timeline.append({ type: "plugin", id: rowId, kind: STATUS_KIND, version: STATUS_VERSION, data })
+      .catch((error) => log(`${short(agentId)}: could not show the status row: ${String(error)}`));
+  }
 
   function save(): Promise<void> {
     const snapshot = JSON.stringify(state, null, 2);
@@ -141,7 +168,9 @@ export default function contribute(server: PluginServerContext) {
   }
 
   function drop(agentId: string, reason: string): void {
-    if (!state.pending[agentId]) return;
+    const pending = state.pending[agentId];
+    if (!pending) return;
+    show(agentId, rowIdOf(pending), { state: "cancelled", windows: pending.windows ?? [], reason });
     delete state.pending[agentId];
     log(`${short(agentId)}: resume dropped (${reason})`);
     void save();
@@ -152,7 +181,7 @@ export default function contribute(server: PluginServerContext) {
     if (!info) return drop(pending.agentId, "agent no longer exists");
     if (info.archived) return drop(pending.agentId, "agent is archived");
     if (info.status === "running" || info.status === "initializing")
-      return drop(pending.agentId, "agent is already working again");
+      return drop(pending.agentId, "the agent is already working again");
 
     delete state.pending[pending.agentId];
     state.attempts[pending.agentId] = (state.attempts[pending.agentId] ?? 0) + 1;
@@ -160,6 +189,11 @@ export default function contribute(server: PluginServerContext) {
     await execCommand("paseo", ["send", pending.agentId, "--no-wait", "--prompt", RESUME_PROMPT], {
       env: process.env,
       timeout: CLI_TIMEOUT_MS,
+    });
+    show(pending.agentId, rowIdOf(pending), {
+      state: "resumed",
+      windows: pending.windows ?? [],
+      attempt: state.attempts[pending.agentId],
     });
     log(
       `${short(pending.agentId)}: resumed (attempt ${state.attempts[pending.agentId]} of ${MAX_ATTEMPTS})`,
@@ -169,7 +203,7 @@ export default function contribute(server: PluginServerContext) {
   /** Reads the agent's quota and either reschedules the resume or sends it. */
   async function settle(pending: Pending): Promise<void> {
     const now = Date.now();
-    if (now - pending.detectedAt > MAX_PENDING_MS) return drop(pending.agentId, "waited too long");
+    if (now - pending.detectedAt > MAX_PENDING_MS) return drop(pending.agentId, "the quota did not come back within 8 days");
 
     const info = await inspectAgent(pending.agentId);
     if (!info) return drop(pending.agentId, "agent no longer exists");
@@ -198,6 +232,12 @@ export default function contribute(server: PluginServerContext) {
       const target = depletion.resetsAt === null ? 0 : depletion.resetsAt + RESET_MARGIN_MS;
       // A reset time in the past means the report has not rolled over yet.
       pending.dueAt = target > now ? target : now + RECHECK_MS;
+      pending.windows = depletion.labels;
+      show(pending.agentId, rowIdOf(pending), {
+        state: "waiting",
+        windows: depletion.labels,
+        resumeAt: target > now ? target : null,
+      });
       log(
         `${short(pending.agentId)}: ${depletion.labels.join(", ")} depleted, next check ${new Date(pending.dueAt).toISOString()}`,
       );
@@ -214,10 +254,11 @@ export default function contribute(server: PluginServerContext) {
 
     // The quota does not look depleted. A failed turn still gets one delayed retry,
     // which covers short provider rate limits; a completed turn was a false alarm.
-    if (pending.outcome === "completed") return drop(pending.agentId, "quota is not depleted");
+    if (pending.outcome === "completed") return drop(pending.agentId, "the quota is not depleted");
     if (!pending.blindRetryScheduled) {
       pending.blindRetryScheduled = true;
       pending.dueAt = now + BLIND_RETRY_MS;
+      show(pending.agentId, rowIdOf(pending), { state: "waiting", resumeAt: pending.dueAt });
       log(`${short(pending.agentId)}: quota not depleted, retrying once in 5 min`);
       return void save();
     }
@@ -247,7 +288,7 @@ export default function contribute(server: PluginServerContext) {
     outcome: PluginTurnOutcome,
     context: PluginHookContext,
   ): Promise<void> {
-    if (outcome.kind === "canceled") return drop(agent.id, "turn canceled by the user");
+    if (outcome.kind === "canceled") return drop(agent.id, "the turn was cancelled");
     // Child agents are left to their parent, which re-drives them once it is resumed.
     if (agent.parentAgentId) {
       const errorText =
@@ -273,6 +314,7 @@ export default function contribute(server: PluginServerContext) {
 
     if ((state.attempts[agent.id] ?? 0) >= MAX_ATTEMPTS) {
       log(`${short(agent.id)}: usage limit again after ${MAX_ATTEMPTS} resumes, giving up`);
+      show(agent.id, `usage-resume-${Date.now()}`, { state: "gave_up" });
       return;
     }
 
@@ -285,7 +327,9 @@ export default function contribute(server: PluginServerContext) {
       dueAt: now,
       sawDepletion: false,
       blindRetryScheduled: false,
+      rowId: `usage-resume-${now}`,
     };
+    show(agent.id, `usage-resume-${now}`, { state: "checking" });
     log(`${short(agent.id)}: turn stopped by a usage limit (${agent.provider})`);
     await save();
     await run(agent.id);
@@ -293,13 +337,16 @@ export default function contribute(server: PluginServerContext) {
 
   const removers = [
     server.addHook("agent.turn.after", async ({ agent, turnId, outcome }, context) => {
+      api = context.paseo;
       await onTurnEnd(agent, turnId, outcome, context);
     }),
     // Someone prompted the agent while a resume was pending: their prompt takes over.
-    server.addHook("agent.turn.before", async ({ agent }) => {
-      drop(agent.id, "agent was prompted");
+    server.addHook("agent.turn.before", async ({ agent }, context) => {
+      api = context.paseo;
+      drop(agent.id, "the agent received a new message");
     }),
-    server.addHook("agent.archive.after", async ({ agent }) => {
+    server.addHook("agent.archive.after", async ({ agent }, context) => {
+      api = context.paseo;
       drop(agent.id, "agent archived");
       if (state.attempts[agent.id]) {
         delete state.attempts[agent.id];
