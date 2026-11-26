@@ -34,7 +34,7 @@ export type SettingData = z.infer<typeof settingSchema>;
 
 /** Turns auto-resume on or off for one agent. Omit `enabled` to toggle. */
 export const setAutoResume = defineRpc({
-  name: "autoResume.set",
+  name: "auto-resume.set",
   input: z.object({ agentId: z.string(), enabled: z.boolean().optional() }),
   output: z.object({ enabled: z.boolean(), cancelledPending: z.boolean() }),
 });
