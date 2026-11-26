@@ -8,6 +8,22 @@ While a resume is pending, the agent's conversation shows a status row: the limi
 was reached, the time the agent will be resumed, and afterwards whether it was resumed or
 the resume was cancelled and why.
 
+## Turning it off for one agent
+
+Auto-resume is on for every top-level agent by default. To turn it off for one agent, use
+any of these:
+
+- The **Don't resume** button on the status row while a resume is pending. This cancels
+  the pending resume and turns auto-resume off for that agent.
+- `/autoresume off` in the agent's composer. `/autoresume on` turns it back on, and
+  `/autoresume` with no argument toggles it.
+- **Turn off auto-resume for this agent** or **Turn on auto-resume for this agent** in the
+  Command Center (⌘K).
+
+The agent's conversation shows a row confirming the change. When an agent with auto-resume
+off hits a usage limit, its status row says so and nothing is scheduled. The setting is
+saved with the plugin's state and cleared when the agent is archived.
+
 ## How it decides
 
 - A turn counts as limited when its error, or its last short message, is a usage-limit
@@ -31,7 +47,7 @@ providers that report quota windows, such as Claude and Codex.
 ## What it reads and writes
 
 It reads the last rows of an ended turn and the account quota through `paseo usage`.
-Pending resumes are saved in `usage-resume/state.json` under the daemon home, so they
+Pending resumes and per-agent settings are saved in `usage-resume/state.json` under the daemon home, so they
 survive a daemon restart. Nothing leaves the daemon machine.
 
 ## Limits

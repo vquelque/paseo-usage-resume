@@ -1,7 +1,7 @@
-import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
-import { useMemo } from "react";
-import { Text, View } from "react-native";
-import type { StatusData } from "../shared/status";
+import { type PluginTimelineItemProps, useRpc } from "@getpaseo/plugin/client";
+import { useMemo, useState } from "react";
+import { Pressable, Text, View } from "react-native";
+import { type SettingData, type StatusData, setAutoResume } from "../shared/status";
 
 function formatWhen(epochMs: number): string {
   const when = new Date(epochMs);
@@ -40,6 +40,12 @@ function describe(data: StatusData): { title: string; detail: string | null } {
         title: "Automatic resume cancelled",
         detail: data.reason ? `Reason: ${data.reason}.` : null,
       };
+    case "disabled":
+      return {
+        title: `Usage limit reached${windows}`,
+        detail:
+          "Auto-resume is off for this agent. Send it a message to continue, or run /autoresume on.",
+      };
     case "gave_up":
       return {
         title: "Usage limit reached again",
@@ -48,14 +54,17 @@ function describe(data: StatusData): { title: string; detail: string | null } {
   }
 }
 
-export function StatusRow({ theme, layout, item }: PluginTimelineItemProps<StatusData>) {
+export function StatusRow({ theme, layout, item, agentId }: PluginTimelineItemProps<StatusData>) {
   const data = item.data;
+  const setEnabled = useRpc(setAutoResume);
+  const [action, setAction] = useState<"idle" | "pending" | "error">("idle");
+  const cancellable = data.state === "checking" || data.state === "waiting";
   const tone =
     data.state === "resumed"
       ? theme.colors.statusSuccess
       : data.state === "gave_up"
         ? theme.colors.statusDanger
-        : data.state === "cancelled"
+        : data.state === "cancelled" || data.state === "disabled"
           ? theme.colors.foregroundMuted
           : theme.colors.statusWarning;
   const styles = useMemo(
@@ -74,6 +83,16 @@ export function StatusRow({ theme, layout, item }: PluginTimelineItemProps<Statu
       body: { flex: 1, gap: 2 },
       title: { color: theme.colors.foreground, fontSize: 13, fontWeight: "600" as const },
       detail: { color: theme.colors.foregroundMuted, fontSize: 13 },
+      button: {
+        alignSelf: "center" as const,
+        paddingVertical: 6,
+        paddingHorizontal: 10,
+        borderRadius: 6,
+        borderWidth: 1,
+        borderColor: theme.colors.border,
+        backgroundColor: theme.colors.surface2,
+      },
+      buttonText: { color: theme.colors.foreground, fontSize: 12, fontWeight: "500" as const },
     }),
     [theme, layout.compact, tone],
   );
@@ -84,7 +103,52 @@ export function StatusRow({ theme, layout, item }: PluginTimelineItemProps<Statu
       <View style={styles.body}>
         <Text style={styles.title}>{title}</Text>
         {detail ? <Text style={styles.detail}>{detail}</Text> : null}
+        {action === "error" ? (
+          <Text style={styles.detail}>Could not turn off auto-resume. Try /autoresume off.</Text>
+        ) : null}
       </View>
+      {cancellable ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Don't resume this agent automatically"
+          disabled={action === "pending"}
+          style={({ pressed }) => [styles.button, { opacity: pressed || action === "pending" ? 0.6 : 1 }]}
+          onPress={() => {
+            setAction("pending");
+            setEnabled({ agentId, enabled: false })
+              .then(() => setAction("idle"))
+              .catch(() => setAction("error"));
+          }}
+        >
+          <Text style={styles.buttonText}>{action === "pending" ? "Cancelling…" : "Don't resume"}</Text>
+        </Pressable>
+      ) : null}
+    </View>
+  );
+}
+
+export function SettingRow({ theme, layout, item }: PluginTimelineItemProps<SettingData>) {
+  const { enabled, cancelledPending } = item.data;
+  const styles = useMemo(
+    () => ({
+      row: {
+        paddingVertical: 6,
+        paddingHorizontal: layout.compact ? 10 : 12,
+        borderLeftWidth: 3,
+        borderLeftColor: theme.colors.foregroundMuted,
+      },
+      text: { color: theme.colors.foregroundMuted, fontSize: 13 },
+    }),
+    [theme, layout.compact],
+  );
+  const text = enabled
+    ? "Auto-resume turned on. This agent will be resumed after a usage limit resets."
+    : cancelledPending
+      ? "Auto-resume turned off. The pending resume was cancelled."
+      : "Auto-resume turned off. This agent will not be resumed after a usage limit.";
+  return (
+    <View style={styles.row} accessibilityRole="text">
+      <Text style={styles.text}>{text}</Text>
     </View>
   );
 }

@@ -9,7 +9,15 @@ import {
   type PluginTurnOutcome,
 } from "@getpaseo/plugin/server";
 import { findDepletion, looksLikeLimit, type UsageEntry } from "./server/limit";
-import { STATUS_KIND, STATUS_VERSION, type StatusData } from "./shared/status";
+import {
+  SETTING_KIND,
+  SETTING_VERSION,
+  STATUS_KIND,
+  STATUS_VERSION,
+  setAutoResume,
+  type SettingData,
+  type StatusData,
+} from "./shared/status";
 
 /** Sent to the agent once its quota is back. */
 const RESUME_PROMPT =
@@ -45,6 +53,8 @@ interface Pending {
 interface State {
   pending: Record<string, Pending>;
   attempts: Record<string, number>;
+  /** Agents the user opted out of auto-resume. */
+  disabled: Record<string, true>;
 }
 
 const stateFile = join(
@@ -64,9 +74,13 @@ function short(agentId: string): string {
 async function loadState(): Promise<State> {
   try {
     const parsed = JSON.parse(await readFile(stateFile, "utf8")) as Partial<State>;
-    return { pending: parsed.pending ?? {}, attempts: parsed.attempts ?? {} };
+    return {
+      pending: parsed.pending ?? {},
+      attempts: parsed.attempts ?? {},
+      disabled: parsed.disabled ?? {},
+    };
   } catch {
-    return { pending: {}, attempts: {} };
+    return { pending: {}, attempts: {}, disabled: {} };
   }
 }
 
@@ -127,7 +141,7 @@ async function turnTail(
 }
 
 export default function contribute(server: PluginServerContext) {
-  let state: State = { pending: {}, attempts: {} };
+  let state: State = { pending: {}, attempts: {}, disabled: {} };
   let saving: Promise<void> = Promise.resolve();
   let stopped = false;
   const busy = new Set<string>();
@@ -312,6 +326,12 @@ export default function contribute(server: PluginServerContext) {
       return;
     }
 
+    if (state.disabled[agent.id]) {
+      log(`${short(agent.id)}: usage limit reached, auto-resume is off for this agent`);
+      show(agent.id, `usage-resume-${Date.now()}`, { state: "disabled" });
+      return;
+    }
+
     if ((state.attempts[agent.id] ?? 0) >= MAX_ATTEMPTS) {
       log(`${short(agent.id)}: usage limit again after ${MAX_ATTEMPTS} resumes, giving up`);
       show(agent.id, `usage-resume-${Date.now()}`, { state: "gave_up" });
@@ -348,18 +368,48 @@ export default function contribute(server: PluginServerContext) {
     server.addHook("agent.archive.after", async ({ agent }, context) => {
       api = context.paseo;
       drop(agent.id, "agent archived");
-      if (state.attempts[agent.id]) {
+      if (state.attempts[agent.id] || state.disabled[agent.id]) {
         delete state.attempts[agent.id];
+        delete state.disabled[agent.id];
         void save();
       }
     }),
   ];
+
+  server.handle(setAutoResume, async ({ agentId, enabled }, context) => {
+    api = context.paseo;
+    await ready;
+    const next = enabled ?? Boolean(state.disabled[agentId]);
+    let cancelledPending = false;
+    if (next) {
+      delete state.disabled[agentId];
+    } else {
+      state.disabled[agentId] = true;
+      cancelledPending = Boolean(state.pending[agentId]);
+      drop(agentId, "auto-resume was turned off for this agent");
+    }
+    await save();
+    log(`${short(agentId)}: auto-resume turned ${next ? "on" : "off"}`);
+    const data: SettingData = { enabled: next, cancelledPending };
+    await context.paseo.agents
+      .ref(agentId)
+      .timeline.append({
+        type: "plugin",
+        id: `usage-resume-setting-${Date.now()}`,
+        kind: SETTING_KIND,
+        version: SETTING_VERSION,
+        data,
+      })
+      .catch((error) => log(`${short(agentId)}: could not show the setting row: ${String(error)}`));
+    return { enabled: next, cancelledPending };
+  });
 
   const ready = loadState().then((loaded) => {
     // Hooks may have fired while the file was loading; their entries win.
     state = {
       pending: { ...loaded.pending, ...state.pending },
       attempts: { ...loaded.attempts, ...state.attempts },
+      disabled: { ...loaded.disabled, ...state.disabled },
     };
     const count = Object.keys(state.pending).length;
     log(`started, ${count} pending resume${count === 1 ? "" : "s"}`);
